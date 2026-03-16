@@ -23,6 +23,7 @@ from loguru import logger
 
 from chunkhound.core.models import Chunk, Embedding, File
 from chunkhound.core.types.common import ChunkType, Language
+from chunkhound.core.types import FileId, FilePath, Timestamp
 from chunkhound.core.utils import normalize_path_for_lookup
 from chunkhound.embeddings import EmbeddingManager
 from chunkhound.providers.database.like_utils import escape_like_pattern
@@ -139,35 +140,16 @@ class SurrealDBProvider(SerialDatabaseProvider):
     def _executor_connect(self, conn: Any, state: dict[str, Any]) -> None:
         """Executor method for connect - runs in DB thread."""
         try:
-            # Import here to allow lazy loading
-            import asyncio
-
-            # Get or create event loop
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-            # Connect to SurrealDB
-            async def _connect():
-                await conn.connect()
-                await conn.signin({
-                    "username": self._username,
-                    "password": self._password,
-                })
-                await conn.use(
-                    namespace=self._namespace,
-                    database=self._database,
-                )
-
-            if loop.is_running():
-                # If loop is running, we need to use run_coroutine_threadsafe
-                import concurrent.futures
-                future = asyncio.run_coroutine_threadsafe(_connect(), loop)
-                future.result(timeout=30)
-            else:
-                loop.run_until_complete(_connect())
+            # SurrealDB blocking client connects automatically on instantiation
+            # Just need to signin and use the namespace/database
+            conn.signin({
+                "username": self._username,
+                "password": self._password,
+            })
+            conn.use(
+                namespace=self._namespace,
+                database=self._database,
+            )
 
             self._connected = True
             self._client = conn
@@ -182,38 +164,21 @@ class SurrealDBProvider(SerialDatabaseProvider):
     def _executor_create_schema(self, conn: Any, state: dict[str, Any]) -> None:
         """Create SurrealDB schema for files, chunks, and embeddings."""
         schema_sql = """
-        -- Files table
-        DEFINE TABLE IF NOT EXISTS file SCHEMAFULL;
-        DEFINE FIELD IF NOT EXISTS file.path ON file TYPE string;
-        DEFINE FIELD IF NOT EXISTS file.size ON file TYPE number;
-        DEFINE FIELD IF NOT EXISTS file.modified_time ON file TYPE float;
-        DEFINE FIELD IF NOT EXISTS file.content_hash ON file TYPE string;
-        DEFINE FIELD IF NOT EXISTS file.indexed_time ON file TYPE float;
-        DEFINE FIELD IF NOT EXISTS file.language ON file TYPE option<string>;
-        DEFINE FIELD IF NOT EXISTS file.encoding ON file TYPE option<string>;
-        DEFINE FIELD IF NOT EXISTS file.line_count ON file TYPE option<number>;
+        -- Files table (schemaless for SurrealDB 3.x compatibility)
+        DEFINE TABLE IF NOT EXISTS file;
 
         -- Unique index on file path
         DEFINE INDEX IF NOT EXISTS idx_file_path ON file FIELDS path UNIQUE;
 
-        -- Chunks table
-        DEFINE TABLE IF NOT EXISTS chunk SCHEMAFULL;
-        DEFINE FIELD IF NOT EXISTS chunk.file_id ON chunk TYPE record<file>;
-        DEFINE FIELD IF NOT EXISTS chunk.content ON chunk TYPE string;
-        DEFINE FIELD IF NOT EXISTS chunk.start_line ON chunk TYPE number;
-        DEFINE FIELD IF NOT EXISTS chunk.end_line ON chunk TYPE number;
-        DEFINE FIELD IF NOT EXISTS chunk.chunk_type ON chunk TYPE string;
-        DEFINE FIELD IF NOT EXISTS chunk.language ON chunk TYPE string;
-        DEFINE FIELD IF NOT EXISTS chunk.name ON chunk TYPE option<string>;
-        DEFINE FIELD IF NOT EXISTS chunk.metadata ON chunk TYPE option<string>;
-        DEFINE FIELD IF NOT EXISTS chunk.created_time ON file TYPE float;
+        -- Chunks table (schemaless for SurrealDB 3.x compatibility)
+        DEFINE TABLE IF NOT EXISTS chunk;
 
         -- Index on file_id for chunk lookups
         DEFINE INDEX IF NOT EXISTS idx_chunk_file_id ON chunk FIELDS file_id;
         DEFINE INDEX IF NOT EXISTS idx_chunk_type ON chunk FIELDS chunk_type;
 
-        -- Embeddings table (separate from chunks for multi-provider support)
-        DEFINE TABLE IF NOT EXISTS embedding SCHEMAFULL;
+        -- Embeddings table (schemaless for SurrealDB 3.x compatibility)
+        DEFINE TABLE IF NOT EXISTS embedding;
         DEFINE FIELD IF NOT EXISTS embedding.chunk_id ON embedding TYPE record<chunk>;
         DEFINE FIELD IF NOT EXISTS embedding.vector ON embedding TYPE array<float>;
         DEFINE FIELD IF NOT EXISTS embedding.provider ON embedding TYPE string;
@@ -227,10 +192,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """
 
         try:
-            loop = asyncio.get_event_loop()
-            async def _create_schema():
-                await conn.query(schema_sql)
-            loop.run_until_complete(_create_schema())
+            conn.query(schema_sql)
             logger.debug("SurrealDB schema created")
         except Exception as e:
             logger.warning(f"Schema creation warning: {e}")
@@ -255,10 +217,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """
 
         try:
-            loop = asyncio.get_event_loop()
-            async def _create_index():
-                await self._client.query(create_index)
-            loop.run_until_complete(_create_index())
+            self._client.query(create_index)
             logger.info(f"Created vector index: {index_name}")
         except Exception as e:
             logger.error(f"Failed to create vector index: {e}")
@@ -272,10 +231,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
         drop_sql = f"REMOVE INDEX IF EXISTS {index_name} ON embedding;"
 
         try:
-            loop = asyncio.get_event_loop()
-            async def _drop_index():
-                await self._client.query(drop_sql)
-            loop.run_until_complete(_drop_index())
+            self._client.query(drop_sql)
             logger.info(f"Dropped vector index: {index_name}")
             return index_name
         except Exception as e:
@@ -307,26 +263,39 @@ class SurrealDBProvider(SerialDatabaseProvider):
             line_count = $line_count;
         """
 
+        # Ensure mtime is a valid float - explicitly handle None/Timestamp cases
+        mtime_value = file.mtime
+        if mtime_value is None:
+            mtime_value = time.time()
+        else:
+            mtime_value = float(mtime_value)
+        
+        # Debug logging
+        logger.debug(f"DEBUG: file.path={file.path}, mtype={type(file.mtime)}, mtime_value={mtime_value}")
+        
         params = {
             "path": str(file.path),
-            "size": file.size or 0,
-            "modified_time": file.modified_time or time.time(),
+            "size": file.size_bytes or 0,
+            "modified_time": mtime_value,
             "content_hash": file.content_hash or "",
             "indexed_time": time.time(),
             "language": file.language.value if file.language else None,
-            "encoding": file.encoding,
-            "line_count": file.line_count,
+            "encoding": getattr(file, "encoding", "utf-8") or "utf-8",
+            "line_count": getattr(file, "line_count", None),
         }
+        
+        logger.debug(f"DEBUG params: modified_time={params.get('modified_time')}")
 
-        async def _insert():
-            result = await conn.query(query, params)
-            if result and result[0]:
-                record_id = result[0][0].get("id")
+        result = conn.query(query, params)
+        if isinstance(result, str):
+            logger.error(f"SurrealDB insert file error: {result}")
+        elif result and isinstance(result, list) and len(result) > 0:
+            record = result[0]
+            if isinstance(record, dict):
+                record_id = record.get("id")
                 self._file_id_map[file_id] = record_id
-            return file_id
+        return file_id
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_insert())
 
     def get_file_by_path(
         self, path: str, as_model: bool = False
@@ -340,14 +309,11 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """Get file by path in executor thread."""
         query = "SELECT * FROM file WHERE path = $path LIMIT 1;"
 
-        async def _get():
-            result = await conn.query(query, {"path": path})
-            if result and result[0]:
-                return self._row_to_file(result[0][0], as_model)
-            return None
+        result = conn.query(query, {"path": path})
+        if result and isinstance(result, list) and len(result) > 0:
+            return self._row_to_file(result[0], as_model)
+        return None
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get())
 
     def get_file_by_id(
         self, file_id: int, as_model: bool = False
@@ -363,14 +329,11 @@ class SurrealDBProvider(SerialDatabaseProvider):
         if not record_id:
             return None
 
-        async def _get():
-            result = await conn.select(record_id)
-            if result:
-                return self._row_to_file(result[0], as_model)
-            return None
+        result = conn.select(record_id)
+        if result:
+            return self._row_to_file(result[0], as_model)
+        return None
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get())
 
     def update_file(self, file_id: int, **kwargs: Any) -> None:
         """Update file record with new values."""
@@ -388,11 +351,8 @@ class SurrealDBProvider(SerialDatabaseProvider):
         query = f"UPDATE {record_id} SET {set_clauses};"
         kwargs["updated_time"] = time.time()
 
-        async def _update():
-            await conn.query(query, kwargs)
+        conn.query(query, kwargs)
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_update())
 
     def delete_file_completely(self, file_path: str) -> bool:
         """Delete a file and all its chunks/embeddings completely."""
@@ -404,30 +364,30 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """Delete file and related records in executor thread."""
         # Get file ID first
         async def _delete():
-            result = await conn.query(
+            result = conn.query(
                 "SELECT id FROM file WHERE path = $path;",
                 {"path": file_path}
             )
-            if not result or not result[0]:
+            if not result or not isinstance(result, list) or len(result) == 0:
                 return False
 
-            file_record_id = result[0][0].get("id")
+            file_record_id = result[0].get("id")
 
             # Delete embeddings for chunks in this file
-            await conn.query("""
+            conn.query("""
                 DELETE embedding WHERE chunk_id IN (
                     SELECT id FROM chunk WHERE file_id = $file_id
                 );
             """, {"file_id": file_record_id})
 
             # Delete chunks
-            await conn.query(
+            conn.query(
                 "DELETE chunk WHERE file_id = $file_id;",
                 {"file_id": file_record_id}
             )
 
             # Delete file
-            await conn.query(
+            conn.query(
                 "DELETE file WHERE id = $file_id;",
                 {"file_id": file_record_id}
             )
@@ -495,20 +455,19 @@ class SurrealDBProvider(SerialDatabaseProvider):
             "end_line": chunk.end_line,
             "chunk_type": chunk.chunk_type.value if isinstance(chunk.chunk_type, ChunkType) else str(chunk.chunk_type),
             "language": chunk.language.value if isinstance(chunk.language, Language) else str(chunk.language),
-            "name": chunk.symbol_name,
+            "name": chunk.symbol,
             "metadata": json.dumps(chunk.metadata) if chunk.metadata else None,
             "created_time": time.time(),
         }
 
-        async def _insert():
-            result = await conn.query(query, params)
-            if result and result[0]:
-                record_id = result[0][0].get("id")
+        result = conn.query(query, params)
+        if result and isinstance(result, list) and len(result) > 0:
+            record = result[0]
+            if isinstance(record, dict):
+                record_id = record.get("id")
                 self._chunk_id_map[chunk_id] = record_id
-            return chunk_id
+        return chunk_id
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_insert())
 
     def insert_chunks_batch(self, chunks: list[Chunk]) -> list[int]:
         """Insert multiple chunks in batch and return chunk IDs."""
@@ -538,14 +497,11 @@ class SurrealDBProvider(SerialDatabaseProvider):
         if not record_id:
             return None
 
-        async def _get():
-            result = await conn.select(record_id)
-            if result:
-                return self._row_to_chunk(result[0], as_model)
-            return None
+        result = conn.select(record_id)
+        if result:
+            return self._row_to_chunk(result[0], as_model)
+        return None
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get())
 
     def get_chunks_by_file_id(
         self, file_id: int, as_model: bool = False
@@ -559,17 +515,14 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """Get chunks by file ID in executor thread."""
         file_record_id = self._file_id_map.get(file_id, f"file:{file_id}")
 
-        async def _get():
-            result = await conn.query(
-                "SELECT * FROM chunk WHERE file_id = $file_id ORDER BY start_line;",
-                {"file_id": file_record_id}
-            )
-            if result and result[0]:
-                return [self._row_to_chunk(row, as_model) for row in result[0]]
-            return []
+        result = conn.query(
+            "SELECT * FROM chunk WHERE file_id = $file_id ORDER BY start_line;",
+            {"file_id": file_record_id}
+        )
+        if result and result[0]:
+            return [self._row_to_chunk(row, as_model) for row in result[0]]
+        return []
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get())
 
     async def get_chunks_by_file_id_async(
         self, file_id: int, as_model: bool = False
@@ -589,15 +542,12 @@ class SurrealDBProvider(SerialDatabaseProvider):
         self, conn: Any, state: dict[str, Any], chunk_ids: list[int]
     ) -> None:
         """Delete chunks batch in executor thread."""
-        async def _delete():
-            for chunk_id in chunk_ids:
-                record_id = self._chunk_id_map.get(chunk_id)
-                if record_id:
-                    await conn.query(f"DELETE {record_id};")
-                    del self._chunk_id_map[chunk_id]
+        for chunk_id in chunk_ids:
+            record_id = self._chunk_id_map.get(chunk_id)
+            if record_id:
+                conn.query(f"DELETE {record_id};")
+                del self._chunk_id_map[chunk_id]
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_delete())
 
     def delete_file_chunks(self, file_id: int) -> None:
         """Delete all chunks for a file."""
@@ -609,14 +559,11 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """Delete file chunks in executor thread."""
         file_record_id = self._file_id_map.get(file_id, f"file:{file_id}")
 
-        async def _delete():
-            await conn.query(
-                "DELETE chunk WHERE file_id = $file_id;",
-                {"file_id": file_record_id}
-            )
+        conn.query(
+            "DELETE chunk WHERE file_id = $file_id;",
+            {"file_id": file_record_id}
+        )
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_delete())
 
     def delete_chunks_batch(self, chunk_ids: list[int]) -> None:
         """Delete multiple chunks by IDs."""
@@ -641,11 +588,8 @@ class SurrealDBProvider(SerialDatabaseProvider):
         set_clauses = ", ".join(f"{k} = ${k}" for k in kwargs.keys())
         query = f"UPDATE {record_id} SET {set_clauses};"
 
-        async def _update():
-            await conn.query(query, kwargs)
+        conn.query(query, kwargs)
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_update())
 
     # ========================================================================
     # Embedding Operations
@@ -683,15 +627,14 @@ class SurrealDBProvider(SerialDatabaseProvider):
             "created_time": time.time(),
         }
 
-        async def _insert():
-            result = await conn.query(query, params)
-            if result and result[0]:
-                record_id = result[0][0].get("id")
+        result = conn.query(query, params)
+        if result and isinstance(result, list) and len(result) > 0:
+            record = result[0]
+            if isinstance(record, dict):
+                record_id = record.get("id")
                 self._embedding_id_map[embedding_id] = record_id
-            return embedding_id
+        return embedding_id
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_insert())
 
     def insert_embeddings_batch(
         self,
@@ -741,31 +684,28 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """Get embedding by chunk ID in executor thread."""
         chunk_record_id = self._chunk_id_map.get(chunk_id, f"chunk:{chunk_id}")
 
-        async def _get():
-            result = await conn.query("""
-                SELECT * FROM embedding
-                WHERE chunk_id = $chunk_id
-                AND provider = $provider
-                AND model = $model
-                LIMIT 1;
-            """, {
-                "chunk_id": chunk_record_id,
-                "provider": provider,
-                "model": model,
-            })
-            if result and result[0]:
-                row = result[0][0]
-                return Embedding(
-                    id=0,  # We don't track embedding IDs the same way
-                    chunk_id=chunk_id,
-                    vector=row.get("vector", []),
-                    provider=row.get("provider", ""),
-                    model=row.get("model", ""),
-                )
-            return None
+        result = conn.query("""
+            SELECT * FROM embedding
+            WHERE chunk_id = $chunk_id
+            AND provider = $provider
+            AND model = $model
+            LIMIT 1;
+        """, {
+            "chunk_id": chunk_record_id,
+            "provider": provider,
+            "model": model,
+        })
+        if result and isinstance(result, list) and len(result) > 0:
+            row = result[0]
+            return Embedding(
+                id=0,  # We don't track embedding IDs the same way
+                chunk_id=chunk_id,
+                vector=row.get("vector", []),
+                provider=row.get("provider", ""),
+                model=row.get("model", ""),
+            )
+        return None
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get())
 
     def get_existing_embeddings(
         self, chunk_ids: list[int], provider: str, model: str
@@ -791,7 +731,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
         ]
 
         async def _get():
-            result = await conn.query("""
+            result = conn.query("""
                 SELECT chunk_id FROM embedding
                 WHERE chunk_id IN $chunk_ids
                 AND provider = $provider
@@ -826,14 +766,11 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """Delete embeddings by chunk ID in executor thread."""
         chunk_record_id = self._chunk_id_map.get(chunk_id, f"chunk:{chunk_id}")
 
-        async def _delete():
-            await conn.query(
-                "DELETE embedding WHERE chunk_id = $chunk_id;",
-                {"chunk_id": chunk_record_id}
-            )
+        conn.query(
+            "DELETE embedding WHERE chunk_id = $chunk_id;",
+            {"chunk_id": chunk_record_id}
+        )
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_delete())
 
     def get_all_chunks_with_metadata(self) -> list[dict[str, Any]]:
         """Get all chunks with their metadata including file paths."""
@@ -843,40 +780,37 @@ class SurrealDBProvider(SerialDatabaseProvider):
         self, conn: Any, state: dict[str, Any]
     ) -> list[dict[str, Any]]:
         """Get all chunks with metadata in executor thread."""
-        async def _get():
-            result = await conn.query("""
-                SELECT
-                    chunk.id,
-                    chunk.content,
-                    chunk.start_line,
-                    chunk.end_line,
-                    chunk.chunk_type,
-                    chunk.language,
-                    chunk.name,
-                    chunk.metadata,
-                    file.path AS file_path
-                FROM chunk
-                FETCH file_id;
-            """)
-            if result and result[0]:
-                return [
-                    {
-                        "id": row.get("id"),
-                        "code": row.get("content"),
-                        "start_line": row.get("start_line"),
-                        "end_line": row.get("end_line"),
-                        "chunk_type": row.get("chunk_type"),
-                        "language": row.get("language"),
-                        "symbol_name": row.get("name"),
-                        "file_path": row.get("file_path"),
-                        "metadata": json.loads(row.get("metadata", "{}")),
-                    }
-                    for row in result[0]
-                ]
-            return []
+        result = conn.query("""
+            SELECT
+                chunk.id,
+                chunk.content,
+                chunk.start_line,
+                chunk.end_line,
+                chunk.chunk_type,
+                chunk.language,
+                chunk.name,
+                chunk.metadata,
+                file.path AS file_path
+            FROM chunk
+            FETCH file_id;
+        """)
+        if result and result[0]:
+            return [
+                {
+                    "id": row.get("id"),
+                    "code": row.get("content"),
+                    "start_line": row.get("start_line"),
+                    "end_line": row.get("end_line"),
+                    "chunk_type": row.get("chunk_type"),
+                    "language": row.get("language"),
+                    "symbol": row.get("name"),
+                    "file_path": row.get("file_path"),
+                    "metadata": json.loads(row.get("metadata", "{}")),
+                }
+                for row in result[0]
+            ]
+        return []
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get())
 
     # ========================================================================
     # Search Operations
@@ -952,7 +886,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
             params["path_filter"] = f".*{path_filter}.*"
 
         async def _search():
-            result = await conn.query(query, params)
+            result = conn.query(query, params)
             results = []
             if result and result[0]:
                 for row in result[0]:
@@ -966,7 +900,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
                             "end_line": row.get("end_line"),
                             "chunk_type": row.get("chunk_type"),
                             "language": row.get("language"),
-                            "symbol_name": row.get("name"),
+                            "symbol": row.get("name"),
                             "file_path": row.get("file_path"),
                             "score": score,
                         })
@@ -1078,68 +1012,63 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """Perform regex search in executor thread."""
         # SurrealDB doesn't have native regex, so we use string matching
         # and filter in Python
-        async def _search():
-            query = """
+        query = """
+            SELECT
+                id,
+                content,
+                start_line,
+                end_line,
+                chunk_type,
+                language,
+                name,
+                file_id.path AS file_path
+            FROM chunk;
+        """
+        if path_filter:
+            query = f"""
                 SELECT
-                    chunk.id,
-                    chunk.content,
-                    chunk.start_line,
-                    chunk.end_line,
-                    chunk.chunk_type,
-                    chunk.language,
-                    chunk.name,
-                    file.path AS file_path
+                    id,
+                    content,
+                    start_line,
+                    end_line,
+                    chunk_type,
+                    language,
+                    name,
+                    file_id.path AS file_path
                 FROM chunk
-                FETCH file_id;
+                WHERE file_id.path =~ $path_filter;
             """
-            if path_filter:
-                query = f"""
-                    SELECT
-                        chunk.id,
-                        chunk.content,
-                        chunk.start_line,
-                        chunk.end_line,
-                        chunk.chunk_type,
-                        chunk.language,
-                        chunk.name,
-                        file.path AS file_path
-                    FROM chunk
-                    WHERE file_id.path =~ $path_filter
-                    FETCH file_id;
-                """
 
-            result = await conn.query(query, {"path_filter": f".*{path_filter}.*"} if path_filter else {})
+        result = conn.query(query, {"path_filter": f".*{path_filter}.*"} if path_filter else {})
 
-            results = []
-            regex = re.compile(pattern, re.IGNORECASE)
-            if result and result[0]:
-                for row in result[0]:
-                    content = row.get("content", "")
-                    if regex.search(content):
-                        results.append({
-                            "id": row.get("id"),
-                            "code": content,
-                            "start_line": row.get("start_line"),
-                            "end_line": row.get("end_line"),
-                            "chunk_type": row.get("chunk_type"),
-                            "language": row.get("language"),
-                            "symbol_name": row.get("name"),
-                            "file_path": row.get("file_path"),
-                        })
+        results = []
+        regex = re.compile(pattern, re.IGNORECASE)
+        # Result is a list of rows directly
+        if result:
+            for row in result:
+                content = row.get("content", "")
+                if regex.search(content):
+                    results.append({
+                        "id": row.get("id"),
+                        "code": content,
+                        "start_line": row.get("start_line"),
+                        "end_line": row.get("end_line"),
+                        "chunk_type": row.get("chunk_type"),
+                        "language": row.get("language"),
+                        "symbol": row.get("name"),
+                        "file_path": row.get("file_path"),
+                    })
 
-            # Apply pagination
-            total = len(results)
-            paginated = results[offset:offset + page_size]
+        # Apply pagination
+        total = len(results)
+        paginated = results[offset:offset + page_size]
 
-            pagination = {
-                "page_size": page_size,
-                "offset": offset,
-                "total": total,
-            }
-            return paginated, pagination
-
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_search())
+        pagination = {
+            "page_size": page_size,
+            "offset": offset,
+            "total": total,
+        }
+        return paginated, pagination
 
     async def search_regex_async(
         self,
@@ -1167,7 +1096,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Perform text search in executor thread."""
         async def _search():
-            result = await conn.query("""
+            result = conn.query("""
                 SELECT
                     chunk.id,
                     chunk.content,
@@ -1198,7 +1127,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
                         "end_line": row.get("end_line"),
                         "chunk_type": row.get("chunk_type"),
                         "language": row.get("language"),
-                        "symbol_name": row.get("name"),
+                        "symbol": row.get("name"),
                         "file_path": row.get("file_path"),
                     })
 
@@ -1232,7 +1161,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
         file_record_id = self._file_id_map.get(file_id, f"file:{file_id}")
 
         async def _get():
-            result = await conn.query("""
+            result = conn.query("""
                 SELECT * FROM chunk
                 WHERE file_id = $file_id
                 AND start_line <= $end_line
@@ -1263,24 +1192,20 @@ class SurrealDBProvider(SerialDatabaseProvider):
         self, conn: Any, state: dict[str, Any]
     ) -> dict[str, int]:
         """Get stats in executor thread."""
-        async def _get():
-            result = await conn.query("""
-                LET $file_count = (SELECT count() FROM file GROUP ALL)[0].count OR 0;
-                LET $chunk_count = (SELECT count() FROM chunk GROUP ALL)[0].count OR 0;
-                LET $embedding_count = (SELECT count() FROM embedding GROUP ALL)[0].count OR 0;
+        result = conn.query("""
+            LET $file_count = (SELECT count() FROM file GROUP ALL)[0].count OR 0;
+            LET $chunk_count = (SELECT count() FROM chunk GROUP ALL)[0].count OR 0;
+            LET $embedding_count = (SELECT count() FROM embedding GROUP ALL)[0].count OR 0;
 
-                RETURN {
-                    file_count: $file_count,
-                    chunk_count: $chunk_count,
-                    embedding_count: $embedding_count
-                };
-            """)
-            if result and result[0]:
-                return result[0][0]
-            return {"file_count": 0, "chunk_count": 0, "embedding_count": 0}
-
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get())
+            RETURN {
+                file_count: $file_count,
+                chunk_count: $chunk_count,
+                embedding_count: $embedding_count
+            };
+        """)
+        if result and isinstance(result, list) and len(result) > 0:
+            return result[0]
+        return {"file_count": 0, "chunk_count": 0, "embedding_count": 0}
 
     async def get_stats_async(self) -> dict[str, int]:
         """Get database statistics (asynchronous)."""
@@ -1296,22 +1221,18 @@ class SurrealDBProvider(SerialDatabaseProvider):
         """Get file stats in executor thread."""
         file_record_id = self._file_id_map.get(file_id, f"file:{file_id}")
 
-        async def _get():
-            result = await conn.query("""
-                LET $chunk_count = (SELECT count() FROM chunk WHERE file_id = $file_id GROUP ALL)[0].count OR 0;
-                LET $embedding_count = (SELECT count() FROM embedding WHERE chunk_id.file_id = $file_id GROUP ALL)[0].count OR 0;
+        result = conn.query("""
+            LET $chunk_count = (SELECT count() FROM chunk WHERE file_id = $file_id GROUP ALL)[0].count OR 0;
+            LET $embedding_count = (SELECT count() FROM embedding WHERE chunk_id.file_id = $file_id GROUP ALL)[0].count OR 0;
 
-                RETURN {
-                    chunk_count: $chunk_count,
-                    embedding_count: $embedding_count
-                };
-            """, {"file_id": file_record_id})
-            if result and result[0]:
-                return result[0][0]
-            return {"chunk_count": 0, "embedding_count": 0}
-
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get())
+            RETURN {
+                chunk_count: $chunk_count,
+                embedding_count: $embedding_count
+            };
+        """, {"file_id": file_record_id})
+        if result and isinstance(result, list) and len(result) > 0:
+            return result[0]
+        return {"chunk_count": 0, "embedding_count": 0}
 
     def get_provider_stats(self, provider: str, model: str) -> dict[str, Any]:
         """Get statistics for a specific embedding provider/model."""
@@ -1321,22 +1242,18 @@ class SurrealDBProvider(SerialDatabaseProvider):
         self, conn: Any, state: dict[str, Any], provider: str, model: str
     ) -> dict[str, Any]:
         """Get provider stats in executor thread."""
-        async def _get():
-            result = await conn.query("""
-                LET $count = (SELECT count() FROM embedding WHERE provider = $provider AND model = $model GROUP ALL)[0].count OR 0;
+        result = conn.query("""
+            LET $count = (SELECT count() FROM embedding WHERE provider = $provider AND model = $model GROUP ALL)[0].count OR 0;
 
-                RETURN {
-                    count: $count,
-                    provider: $provider,
-                    model: $model
-                };
-            """, {"provider": provider, "model": model})
-            if result and result[0]:
-                return result[0][0]
-            return {"count": 0, "provider": provider, "model": model}
-
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_get())
+            RETURN {
+                count: $count,
+                provider: $provider,
+                model: $model
+            };
+        """, {"provider": provider, "model": model})
+        if result and isinstance(result, list) and len(result) > 0:
+            return result[0]
+        return {"count": 0, "provider": provider, "model": model}
 
     # ========================================================================
     # Transaction and Bulk Operations
@@ -1352,14 +1269,11 @@ class SurrealDBProvider(SerialDatabaseProvider):
         self, conn: Any, state: dict[str, Any], query: str, params: list[Any] | None
     ) -> list[dict[str, Any]]:
         """Execute query in executor thread."""
-        async def _execute():
-            result = await conn.query(query, params or {})
-            if result:
-                return result[0] if isinstance(result, list) and len(result) > 0 else result
-            return []
+        result = conn.query(query, params or {})
+        if result:
+            return result[0] if isinstance(result, list) and len(result) > 0 else result
+        return []
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_execute())
 
     def begin_transaction(self) -> None:
         """Begin a database transaction."""
@@ -1432,25 +1346,22 @@ class SurrealDBProvider(SerialDatabaseProvider):
         self, conn: Any, state: dict[str, Any]
     ) -> dict[str, Any]:
         """Health check in executor thread."""
-        async def _check():
-            try:
-                result = await conn.query("INFO FOR DB;")
-                return {
-                    "status": "healthy",
-                    "connected": True,
-                    "url": self._url,
-                    "namespace": self._namespace,
-                    "database": self._database,
-                }
-            except Exception as e:
-                return {
-                    "status": "unhealthy",
-                    "connected": False,
-                    "error": str(e),
-                }
+        try:
+            result = conn.query("INFO FOR DB;")
+            return {
+                "status": "healthy",
+                "connected": True,
+                "url": self._url,
+                "namespace": self._namespace,
+                "database": self._database,
+            }
+        except Exception as e:
+            return {
+                "status": "unhealthy",
+                "connected": False,
+                "error": str(e),
+            }
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_check())
 
     def get_connection_info(self) -> dict[str, Any]:
         """Get information about the database connection."""
@@ -1471,23 +1382,19 @@ class SurrealDBProvider(SerialDatabaseProvider):
         if as_model:
             return File(
                 id=0,  # Will be set by caller
-                path=Path(row.get("path", "")),
-                size=row.get("size", 0),
-                modified_time=row.get("modified_time"),
+                path=FilePath(row.get("path", "")),
+                mtime=Timestamp(row.get("modified_time", 0.0)),
+                size_bytes=row.get("size", 0),
                 content_hash=row.get("content_hash"),
-                language=Language(row.get("language")) if row.get("language") else None,
-                encoding=row.get("encoding"),
-                line_count=row.get("line_count"),
+                language=Language(row.get("language")) if row.get("language") else Language.UNKNOWN,
             )
         return {
             "id": 0,  # Will be set by caller
             "path": row.get("path", ""),
-            "size": row.get("size", 0),
-            "modified_time": row.get("modified_time"),
+            "size_bytes": row.get("size", 0),
+            "mtime": row.get("modified_time"),
             "content_hash": row.get("content_hash"),
             "language": row.get("language"),
-            "encoding": row.get("encoding"),
-            "line_count": row.get("line_count"),
         }
 
     def _row_to_chunk(self, row: dict[str, Any], as_model: bool) -> dict[str, Any] | Chunk:
@@ -1504,7 +1411,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
                 end_line=row.get("end_line", 0),
                 chunk_type=ChunkType(chunk_type) if chunk_type in [e.value for e in ChunkType] else ChunkType.CODE,
                 language=Language(language) if language in [e.value for e in Language] else Language.TEXT,
-                symbol_name=row.get("name"),
+                symbol=row.get("name"),
                 metadata=json.loads(row.get("metadata", "{}")),
             )
         return {
@@ -1515,7 +1422,7 @@ class SurrealDBProvider(SerialDatabaseProvider):
             "end_line": row.get("end_line", 0),
             "chunk_type": chunk_type,
             "language": language,
-            "symbol_name": row.get("name"),
+            "symbol": row.get("name"),
             "metadata": json.loads(row.get("metadata", "{}")),
         }
 

@@ -22,8 +22,10 @@ class DatabaseConfig(BaseModel):
     - Default values
     """
 
-    # Database location
-    path: Path | None = Field(default=None, description="Path to database directory")
+    # Database location (Path for file-based providers, str for SurrealDB URLs)
+    path: Path | str | None = Field(
+        default=None, description="Path to database directory or SurrealDB URL (ws://host:port/rpc)"
+    )
 
     # Provider selection
     provider: Literal["duckdb", "lancedb", "surrealdb"] = Field(
@@ -49,10 +51,36 @@ class DatabaseConfig(BaseModel):
         description="Maximum database size in MB before indexing is stopped (None = no limit)",
     )
 
+    # SurrealDB-specific settings
+    surrealdb_namespace: str = Field(
+        default="chunkhound",
+        description="SurrealDB namespace for the database",
+    )
+
+    surrealdb_database: str = Field(
+        default="code_index",
+        description="SurrealDB database name",
+    )
+
+    surrealdb_username: str = Field(
+        default="root",
+        description="SurrealDB username for authentication",
+    )
+
+    surrealdb_password: str = Field(
+        default="root",
+        description="SurrealDB password for authentication",
+    )
+
     @field_validator("path")
-    def validate_path(cls, v: Path | None) -> Path | None:
-        """Convert string paths to Path objects."""
-        if v is not None and not isinstance(v, Path):
+    def validate_path(cls, v: Path | str | None) -> Path | str | None:
+        """Convert string paths to Path objects, but preserve URLs for SurrealDB."""
+        if v is None:
+            return v
+        if isinstance(v, str) and "://" in v:
+            # Preserve URL strings for SurrealDB (ws://, http://, etc.)
+            return v
+        if not isinstance(v, Path):
             return Path(v)
         return v
 
@@ -64,22 +92,29 @@ class DatabaseConfig(BaseModel):
             raise ValueError(f"Invalid provider: {v}. Must be one of {valid_providers}")
         return v
 
-    def get_db_path(self) -> Path:
+    def get_db_path(self) -> Path | str:
         """Get the actual database location for the configured provider.
 
         Returns the final path used by the provider, including all
         provider-specific transformations:
         - DuckDB: path/chunks.db (file) or :memory: for in-memory
         - LanceDB: path/lancedb.lancedb/ (directory with .lancedb suffix)
-        - SurrealDB: path/surrealdb/ (directory for SurrealDB storage)
+        - SurrealDB: URL string (ws://host:port/rpc) or path/surrealdb/ (directory)
 
         This is the authoritative source for database location checks.
         """
         if self.path is None:
             raise ValueError("Database path not configured")
 
+        # SurrealDB with URL connection - return URL string directly
+        if self.provider == "surrealdb" and isinstance(self.path, str) and "://" in self.path:
+            return self.path
+
+        # For non-URL paths, convert to Path if needed
+        path = Path(self.path) if isinstance(self.path, str) else self.path
+
         # Skip directory creation for in-memory databases (":memory:" is invalid on Windows)
-        is_memory = str(self.path) == ":memory:"
+        is_memory = str(path) == ":memory:"
 
         # Backwards-compatible handling:
         # - Older ChunkHound versions used `database.path` as the direct DuckDB
@@ -91,23 +126,23 @@ class DatabaseConfig(BaseModel):
         # legacy DuckDB database file and return it directly instead of trying
         # to create a directory at that location.
         if self.provider == "duckdb" and not is_memory:
-            if self.path.exists() and self.path.is_file():
-                return self.path
+            if path.exists() and path.is_file():
+                return path
 
         if not is_memory:
             # For directory-style layouts, ensure the base path exists.
-            self.path.mkdir(parents=True, exist_ok=True)
+            path.mkdir(parents=True, exist_ok=True)
 
         if self.provider == "duckdb":
-            return self.path if is_memory else self.path / "chunks.db"
+            return path if is_memory else path / "chunks.db"
         elif self.provider == "lancedb":
             # LanceDB adds .lancedb suffix to prevent naming collisions
             # and clarify storage structure (see lancedb_provider.py:111-113)
-            lancedb_base = self.path / "lancedb"
+            lancedb_base = path / "lancedb"
             return lancedb_base.parent / f"{lancedb_base.stem}.lancedb"
         elif self.provider == "surrealdb":
             # SurrealDB stores data in a directory
-            return self.path / "surrealdb"
+            return path / "surrealdb"
         else:
             raise ValueError(f"Unknown database provider: {self.provider}")
 

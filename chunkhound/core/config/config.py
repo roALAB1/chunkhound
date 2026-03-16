@@ -178,6 +178,14 @@ class Config(BaseModel):
                 pass
             self._deep_merge(config_data, kwargs)
 
+        # 7. Provider-specific API key fallbacks
+        # If embedding config exists but no API key, check provider-specific env vars
+        embedding_config = config_data.get("embedding")
+        if isinstance(embedding_config, dict):
+            if embedding_config.get("provider") == "voyageai" and not embedding_config.get("api_key"):
+                if voyage_key := os.getenv("VOYAGE_API_KEY"):
+                    embedding_config["api_key"] = voyage_key
+
         # Special handling for EmbeddingConfig
         if "embedding" in config_data and isinstance(config_data["embedding"], dict):
             # Create EmbeddingConfig instance with the data
@@ -309,8 +317,12 @@ class Config(BaseModel):
             self.database.path = project_root / ".chunkhound" / "db"
 
         # Ensure database path is resolved to canonical form (handles symlinks)
+        # Skip for SurrealDB URLs which are strings, not Path objects
         if self.database.path:
-            self.database.path = self.database.path.resolve()
+            if isinstance(self.database.path, str) and "://" in self.database.path:
+                pass  # URL string, don't resolve
+            else:
+                self.database.path = Path(self.database.path).resolve()
 
         return self
 

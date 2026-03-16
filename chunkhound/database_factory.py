@@ -55,7 +55,13 @@ def _db_root_path_for_config(
     When we feed those canonical paths back into a `Config`, we must convert
     them back to the root so `get_db_path()` stays stable.
     """
-    if str(db_path) == ":memory:":
+    db_path_str = str(db_path)
+    
+    # For URL-based databases (SurrealDB WebSocket), return URL as-is
+    if db_path_str.startswith(("ws://", "wss://", "http://", "https://")):
+        return db_path_str
+    
+    if db_path_str == ":memory:":
         return db_path
 
     path = Path(db_path)
@@ -123,11 +129,14 @@ def create_services(
         else:
             if hasattr(config, "database") and hasattr(config.database, "path"):
                 provider = getattr(config.database, "provider", None)
-                config.database.path = Path(
-                    _db_root_path_for_config(
-                        db_path, provider=str(provider or "duckdb")
-                    )
+                root_path = _db_root_path_for_config(
+                    db_path, provider=str(provider or "duckdb")
                 )
+                # Only wrap in Path for non-URL paths (SurrealDB WebSocket URLs)
+                if isinstance(root_path, str) and root_path.startswith(("ws://", "wss://", "http://", "https://")):
+                    config.database.path = root_path
+                else:
+                    config.database.path = Path(root_path)
             effective_config = config
     except Exception:
         effective_config = config

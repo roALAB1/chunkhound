@@ -5,7 +5,7 @@ from pathlib import Path
 from chunkhound.core.config.config import Config
 
 
-def verify_database_exists(config: Config) -> Path:
+def verify_database_exists(config: Config) -> Path | str:
     """Verify database exists, raising if not found.
 
     Args:
@@ -18,6 +18,12 @@ def verify_database_exists(config: Config) -> Path:
     db_path = config.database.path
     if not db_path:
         raise ValueError("Database path not configured")
+
+    # For non-file databases (SurrealDB WebSocket URLs), skip existence check
+    db_path_str = str(db_path)
+    if db_path_str.startswith(("ws://", "wss://", "http://", "https://")):
+        # Remote databases don't have local file existence - return URL string
+        return db_path_str
 
     # Check existence using transformed path (includes provider-specific suffix)
     actual_db_path = config.database.get_db_path()
