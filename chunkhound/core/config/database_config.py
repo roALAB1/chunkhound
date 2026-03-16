@@ -26,7 +26,7 @@ class DatabaseConfig(BaseModel):
     path: Path | None = Field(default=None, description="Path to database directory")
 
     # Provider selection
-    provider: Literal["duckdb", "lancedb"] = Field(
+    provider: Literal["duckdb", "lancedb", "surrealdb"] = Field(
         default="duckdb", description="Database provider to use"
     )
 
@@ -59,7 +59,7 @@ class DatabaseConfig(BaseModel):
     @field_validator("provider")
     def validate_provider(cls, v: str) -> str:
         """Validate database provider selection."""
-        valid_providers = ["duckdb", "lancedb"]
+        valid_providers = ["duckdb", "lancedb", "surrealdb"]
         if v not in valid_providers:
             raise ValueError(f"Invalid provider: {v}. Must be one of {valid_providers}")
         return v
@@ -71,6 +71,7 @@ class DatabaseConfig(BaseModel):
         provider-specific transformations:
         - DuckDB: path/chunks.db (file) or :memory: for in-memory
         - LanceDB: path/lancedb.lancedb/ (directory with .lancedb suffix)
+        - SurrealDB: path/surrealdb/ (directory for SurrealDB storage)
 
         This is the authoritative source for database location checks.
         """
@@ -104,6 +105,9 @@ class DatabaseConfig(BaseModel):
             # and clarify storage structure (see lancedb_provider.py:111-113)
             lancedb_base = self.path / "lancedb"
             return lancedb_base.parent / f"{lancedb_base.stem}.lancedb"
+        elif self.provider == "surrealdb":
+            # SurrealDB stores data in a directory
+            return self.path / "surrealdb"
         else:
             raise ValueError(f"Unknown database provider: {self.provider}")
 
@@ -126,7 +130,7 @@ class DatabaseConfig(BaseModel):
 
         parser.add_argument(
             "--database-provider",
-            choices=["duckdb", "lancedb"],
+            choices=["duckdb", "lancedb", "surrealdb"],
             help="Database provider to use",
         )
 

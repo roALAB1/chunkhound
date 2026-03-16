@@ -92,6 +92,7 @@ dependencies = [
     "anthropic>=0.75.0",
     "msgpack>=1.0",
     "tomli>=2.0.0; python_version < '3.11'",
+    "surrealdb>=0.5.0",
 ]
 
 [project.optional-dependencies]

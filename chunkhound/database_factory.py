@@ -70,9 +70,16 @@ def _db_root_path_for_config(
             return path.parent
         return path
 
+    if provider == "surrealdb":
+        if path.name == "surrealdb":
+            return path.parent
+        return path
+
     if path.name == "chunks.db":
         return path.parent
     if path.suffix == ".lancedb":
+        return path.parent
+    if path.name == "surrealdb":
         return path.parent
     return path
 

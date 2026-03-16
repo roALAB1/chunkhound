@@ -96,6 +96,31 @@ chunkhound index
 - Multi-language projects needing consistent search
 - Offline/air-gapped development environments
 
+## Database Providers
+
+ChunkHound supports multiple database backends:
+
+| Provider | Description | Best For |
+|----------|-------------|----------|
+| **DuckDB** (default) | Embedded analytical database | Local development, small to medium codebases |
+| **LanceDB** | Serverless vector database | Large-scale vector search, cloud deployments |
+| **SurrealDB** | Multi-model database with built-in vector search | Projects already using SurrealDB, graph queries |
+
+Configure the database provider in `.chunkhound.json`:
+
+```json
+{
+  "database": {
+    "provider": "surrealdb",
+    "path": ".chunkhound/db"
+  },
+  "embedding": {
+    "provider": "voyageai",
+    "api_key": "your-voyageai-key"
+  }
+}
+```
+
 ## License
 
 MIT

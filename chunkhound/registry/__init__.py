@@ -309,6 +309,18 @@ class ProviderRegistry:
                 embedding_manager=embedding_manager,
                 config=self._config.database,
             )
+        elif provider_type == "surrealdb":
+            from chunkhound.providers.database.surrealdb_provider import SurrealDBProvider
+
+            # Get embedding_manager if available for dimension detection
+            embedding_manager = getattr(self, "_embedding_manager", None)
+
+            provider = SurrealDBProvider(
+                db_path,
+                base_directory,
+                embedding_manager=embedding_manager,
+                config=self._config.database,
+            )
         else:
             logger.warning(f"Unknown provider {provider_type}, defaulting to DuckDB")
             from chunkhound.providers.database.duckdb_provider import DuckDBProvider
